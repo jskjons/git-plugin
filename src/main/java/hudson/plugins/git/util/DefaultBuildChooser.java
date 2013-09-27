@@ -1,8 +1,15 @@
 package hudson.plugins.git.util;
 
 import hudson.Extension;
+import hudson.model.AbstractProject;
 import hudson.model.TaskListener;
+import hudson.model.Run;
+import hudson.model.Run.Summary;
 import hudson.plugins.git.*;
+import hudson.plugins.git.util.BuildChooserContext.ContextCallable;
+import hudson.remoting.VirtualChannel;
+import hudson.util.RunList;
+
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.transport.RemoteConfig;
@@ -43,7 +50,7 @@ public class DefaultBuildChooser extends BuildChooser {
         // if the branch name contains more wildcards then the simple usecase
         // does not apply and we need to skip to the advanced usecase
         if (singleBranch == null || singleBranch.contains("*"))
-            return getAdvancedCandidateRevisions(isPollCall,listener,new GitUtils(listener,git),data);
+            return getAdvancedCandidateRevisions(isPollCall,listener,new GitUtils(listener,git),data, context);
 
         // check if we're trying to build a specific commit
         // this only makes sense for a build, there is no
@@ -159,14 +166,15 @@ public class DefaultBuildChooser extends BuildChooser {
      *  NB: Alternate BuildChooser implementations are possible - this
      *  may be beneficial if "only 1" branch is to be built, as much of
      *  this work is irrelevant in that usecase.
+     * @param context 
      * @throws IOException
      * @throws GitException
      */
-    private List<Revision> getAdvancedCandidateRevisions(boolean isPollCall, TaskListener listener, GitUtils utils, BuildData data) throws GitException, IOException {
+    private List<Revision> getAdvancedCandidateRevisions(boolean isPollCall, TaskListener listener, GitUtils utils, BuildData data, BuildChooserContext context) throws GitException, IOException {
         // 1. Get all the (branch) revisions that exist
         List<Revision> revs = new ArrayList<Revision>(utils.getAllBranchRevisions());
         verbose(listener, "Starting with all the branches: {0}", revs);
-
+        
         // 2. Filter out any revisions that don't contain any branches that we
         // actually care about (spec)
         for (Iterator<Revision> i = revs.iterator(); i.hasNext();) {
@@ -203,11 +211,33 @@ public class DefaultBuildChooser extends BuildChooser {
 
         // 4. Finally, remove any revisions that have already been built.
         verbose(listener, "Removing what''s already been built: {0}", data.getBuildsByBranchName());
+        
+        
+        final List<BuildData> buildDatasToCheck = new ArrayList<BuildData>();
+        try {
+            context.actOnProject(new ContextCallable<AbstractProject<?,?>, Void> () {
+                public Void invoke(AbstractProject<?, ?> param, VirtualChannel channel) throws IOException, InterruptedException {
+                    for (Run run : param.getBuilds()) {
+                        if (run.isBuilding()) {
+                            buildDatasToCheck.addAll(run.getActions(BuildData.class));                
+                        }
+                    }
+                    return null;
+                }            
+            });
+        } catch (InterruptedException e) {
+            verbose(listener, "interrupted while inspecting running jobs, duplicate builds may result");
+        }
+        buildDatasToCheck.add(data);
+        
         for (Iterator<Revision> i = revs.iterator(); i.hasNext();) {
             Revision r = i.next();
 
-            if (data.hasBeenBuilt(r.getSha1())) {
-                i.remove();
+            for (BuildData d : buildDatasToCheck) {
+                if (d.hasBeenBuilt(r.getSha1())) {
+                    i.remove();
+                    break;
+                }
             }
         }
         verbose(listener, "After filtering out what''s already been built: {0}", revs);
